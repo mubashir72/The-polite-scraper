@@ -31,10 +31,10 @@ pip install beautifulsoup4 pydantic
 ### Run the scraper
 
 ```bash
-python scraper/src/main.py
+python src/main.py
 ```
 
-Output files appear in `scraper/output/`:
+Output files appear in `output/`:
 - `books.json` — 60 validated book records
 - `errors.json` — any records that failed validation
 - `run-report.json` — run statistics

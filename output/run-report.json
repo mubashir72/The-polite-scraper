@@ -1,0 +1,11 @@
+{
+  "start_time": "2026-10-03T09:18:29Z",
+  "end_time": "2026-10-03T09:19:47Z",
+  "duration_seconds": 78.39,
+  "pages_fetched": 54,
+  "cache_hits": 9,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 0,
+  "failed_urls": []
+}
