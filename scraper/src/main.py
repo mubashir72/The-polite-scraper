@@ -248,13 +248,6 @@ def main():
         if b['url'] not in unique_books:
             unique_books[b['url']] = b
 
-    # Inject one fake URL to prove resilience (test only)
-    fake_url = "https://books.toscrape.com/catalogue/this-book-does-not-exist_0000/index.html"
-    unique_books[fake_url] = {
-        'url': fake_url,
-        'source_page': 'https://books.toscrape.com/catalogue/page-1.html'
-    }
-
     # 2. Extract raw records from each book page (per-page error handling)
     raw_records = []
     for url, info in unique_books.items():

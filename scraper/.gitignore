@@ -4,6 +4,9 @@ __pycache__/
 venv/
 env/
 .env
-data/
-*.html
-*.json
+
+# Cached HTML pages — never commit these
+cache/
+
+# Output is regenerated on each run, but we keep one sample committed
+# To commit sample output, use: git add -f output/
