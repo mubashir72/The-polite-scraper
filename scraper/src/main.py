@@ -4,10 +4,11 @@ import time
 import json
 import datetime
 import urllib.request
+from urllib.error import URLError, HTTPError
 from urllib.parse import urljoin
 from typing import Optional
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, field_validator, HttpUrl
+from pydantic import BaseModel, field_validator
 
 # ── Pydantic schema ─────────────────────────────────────────────
 class BookRecord(BaseModel):
@@ -35,37 +36,91 @@ class BookRecord(BaseModel):
             raise ValueError(f'price_gbp must be positive, got: {v}')
         return v
 
+# ── Run stats tracker ───────────────────────────────────────────
+class RunStats:
+    def __init__(self):
+        self.start_time = datetime.datetime.now(datetime.timezone.utc)
+        self.pages_fetched = 0
+        self.cache_hits = 0
+        self.valid_records = 0
+        self.invalid_records = 0
+        self.failed_pages = 0
+        self.failed_urls = []
+
+    def to_dict(self):
+        end_time = datetime.datetime.now(datetime.timezone.utc)
+        duration = (end_time - self.start_time).total_seconds()
+        return {
+            "start_time": self.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_time": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "duration_seconds": round(duration, 2),
+            "pages_fetched": self.pages_fetched,
+            "cache_hits": self.cache_hits,
+            "valid_records": self.valid_records,
+            "invalid_records": self.invalid_records,
+            "failed_pages": self.failed_pages,
+            "failed_urls": self.failed_urls,
+        }
+
 # ── Helpers ──────────────────────────────────────────────────────
-def fetch_and_cache_page(url, cache_path):
+USER_AGENT = 'FlyRankInternshipA9/1.0 (+https://github.com/mubashir72/The-polite-scraper)'
+
+def fetch_and_cache_page(url, cache_path, stats: RunStats):
+    """Fetch a page with caching, retry on 5xx/timeout, skip on 404/403."""
     if os.path.exists(cache_path):
         with open(cache_path, 'r', encoding='utf-8') as f:
             html = f.read()
+        stats.cache_hits += 1
         return html
 
-    print(f"FETCH: {url}")
-    req = urllib.request.Request(
-        url,
-        headers={'User-Agent': 'FlyRankInternshipA9/1.0 (+https://github.com/mubashir72/The-polite-scraper)'}
-    )
+    max_retries = 2
+    for attempt in range(max_retries):
+        print(f"FETCH (attempt {attempt + 1}): {url}")
+        req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
 
-    try:
-        with urllib.request.urlopen(req, timeout=5) as response:
-            status = response.getcode()
-            if status != 200:
-                print(f"Failed to fetch {url}. Status code: {status}")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                status = response.getcode()
+                if status != 200:
+                    print(f"  Non-200 status: {status}")
+                    return None
+
+                html_bytes = response.read()
+                html = html_bytes.decode('utf-8')
+
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+
+                stats.pages_fetched += 1
+                return html
+
+        except HTTPError as e:
+            code = e.code
+            print(f"  HTTP {code}: {e.reason}")
+            # Do NOT retry 403 or 404
+            if code in (403, 404):
                 return None
+            # Retry on 5xx
+            if code >= 500 and attempt < max_retries - 1:
+                print("  Retrying after 1s...")
+                time.sleep(1)
+                continue
+            return None
 
-            html_bytes = response.read()
-            html = html_bytes.decode('utf-8')
+        except (URLError, TimeoutError, OSError) as e:
+            print(f"  Network error: {e}")
+            if attempt < max_retries - 1:
+                print("  Retrying after 1s...")
+                time.sleep(1)
+                continue
+            return None
 
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                f.write(html)
+        except Exception as e:
+            print(f"  Unexpected error: {e}")
+            return None
 
-            return html
-    except Exception as e:
-        print(f"An error occurred while fetching {url}: {e}")
-        return None
+    return None
 
 
 def extract_catalogue_page(html, base_url):
@@ -154,6 +209,8 @@ def normalize_record(raw: dict) -> dict:
 
 # ── Main pipeline ────────────────────────────────────────────────
 def main():
+    stats = RunStats()
+
     start_url = "https://books.toscrape.com/catalogue/page-1.html"
     current_url = start_url
 
@@ -176,7 +233,7 @@ def main():
         if not is_cached and catalogue_pages > 1:
             time.sleep(0.5)
 
-        html = fetch_and_cache_page(current_url, cache_path)
+        html = fetch_and_cache_page(current_url, cache_path, stats)
         if not html:
             break
 
@@ -191,19 +248,32 @@ def main():
         if b['url'] not in unique_books:
             unique_books[b['url']] = b
 
-    # 2. Extract raw records from each book page
+    # Inject one fake URL to prove resilience (test only)
+    fake_url = "https://books.toscrape.com/catalogue/this-book-does-not-exist_0000/index.html"
+    unique_books[fake_url] = {
+        'url': fake_url,
+        'source_page': 'https://books.toscrape.com/catalogue/page-1.html'
+    }
+
+    # 2. Extract raw records from each book page (per-page error handling)
     raw_records = []
     for url, info in unique_books.items():
-        parts = url.split('/')
-        book_id = parts[-2] if len(parts) > 1 else "unknown"
-        cache_path = os.path.join(base_dir, "cache", f"book_{book_id}.html")
+        try:
+            parts = url.split('/')
+            book_id = parts[-2] if len(parts) > 1 else "unknown"
+            cache_path = os.path.join(base_dir, "cache", f"book_{book_id}.html")
 
-        is_cached = os.path.exists(cache_path)
-        if not is_cached:
-            time.sleep(0.5)
+            is_cached = os.path.exists(cache_path)
+            if not is_cached:
+                time.sleep(0.5)
 
-        html = fetch_and_cache_page(url, cache_path)
-        if html:
+            html = fetch_and_cache_page(url, cache_path, stats)
+            if not html:
+                stats.failed_pages += 1
+                stats.failed_urls.append(url)
+                print(f"  SKIPPED (no HTML): {url}")
+                continue
+
             if is_cached:
                 mtime = os.path.getmtime(cache_path)
                 fetched_at = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -213,6 +283,15 @@ def main():
             record = extract_book_details(html, url, info['source_page'], fetched_at)
             if record:
                 raw_records.append(record)
+            else:
+                stats.failed_pages += 1
+                stats.failed_urls.append(url)
+                print(f"  SKIPPED (parse failed): {url}")
+
+        except Exception as e:
+            stats.failed_pages += 1
+            stats.failed_urls.append(url)
+            print(f"  ERROR processing {url}: {e}")
 
     # 3. Normalize + Validate
     valid_records = []
@@ -238,6 +317,9 @@ def main():
             deduped.append(rec)
     valid_records = deduped
 
+    stats.valid_records = len(valid_records)
+    stats.invalid_records = len(error_records)
+
     # 4. Store
     output_dir = os.path.join(base_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
@@ -250,19 +332,21 @@ def main():
     with open(errors_path, 'w', encoding='utf-8') as f:
         json.dump(error_records, f, indent=2, ensure_ascii=False)
 
-    # 5. Checkpoint report
-    if valid_records:
-        print(json.dumps(valid_records[0], indent=2))
+    # 5. Write run report
+    report = stats.to_dict()
+    report_path = os.path.join(output_dir, "run-report.json")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
 
-    all_prices_numeric = all(isinstance(r['price_gbp'], float) for r in valid_records)
-    all_urls_https = all(r['product_url'].startswith('https://') for r in valid_records)
-
-    print(f"\nbooks.json: {len(valid_records)} records")
-    print(f"errors.json: {len(error_records)} records")
-    print(f"all price_gbp numeric: {all_prices_numeric}")
-    print(f"all URLs https: {all_urls_https}")
+    # 6. Print summary
+    print(f"\n{'='*50}")
+    print(f"RUN REPORT")
+    print(f"{'='*50}")
+    print(json.dumps(report, indent=2))
+    print(f"\nbooks.json:  {stats.valid_records} records")
+    print(f"errors.json: {stats.invalid_records} records")
+    print(f"failed_pages: {stats.failed_pages}")
 
 
 if __name__ == "__main__":
     main()
-
