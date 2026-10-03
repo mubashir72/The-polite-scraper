@@ -1,1 +1,0 @@
-# The-polite-scraper
